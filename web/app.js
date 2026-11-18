@@ -8,7 +8,7 @@ const state = {
   config: {}, overview: null, selected: localStorage.getItem("fl.sel") || "all",
   section: "holdings", sort: { key: "current", dir: -1 }, q: "",
   loading: false, auto: localStorage.getItem("fl.auto") !== "0", expanded: new Set(), timer: null,
-  watch: null, watchSort: { key: "dayPct", dir: -1 }, sugg: [], suggIdx: -1, indices: null, caps: null, capFilter: null, accFilter: null, privacy: localStorage.getItem("fl.privacy") === "1",
+  watch: null, watchSort: { key: "dayPct", dir: -1 }, sugg: [], suggIdx: -1, indices: null, caps: null, capFilter: null, accFilter: null, privacy: localStorage.getItem("fl.privacy") === "1", hist: {}, histOverview: null, histView: "capital",
 };
 
 /* ------------------------------------------------------------ formatting */
@@ -210,7 +210,7 @@ function statsHTML(t, n) {
 }
 
 function tabsHTML(t) {
-  const tabs = [["holdings", "Holdings", t.holdings], ["positions", "Positions", t.positions], ["orders", "Orders", t.orders], ["mf", "Mutual funds", null], ["funds", "Funds", null], ["watch", "Watchlist", state.watch?.items.length || null], ["indices", "Indices", null], ["screener", "Screener", null]];
+  const tabs = [["holdings", "Holdings", t.holdings], ["positions", "Positions", t.positions], ["orders", "Orders", t.orders], ["mf", "Mutual funds", null], ["funds", "Funds", null], ["watch", "Watchlist", state.watch?.items.length || null], ["indices", "Indices", null], ["screener", "Screener", null], ["history", "History", null]];
   return `<div class="tabs">${tabs.map(([k, l, n]) => `<button class="tab ${state.section === k ? "active" : ""}" data-sec="${k}">${l}${n ? `<span class="n">${n}</span>` : ""}</button>`).join("")}</div>`;
 }
 
@@ -224,6 +224,7 @@ function sectionHTML(list, live, t, isAll) {
     case "watch": return watchHTML(list, isAll);
     case "indices": return indicesHTML();
     case "screener": return screenerHTML();
+    case "history": return historyHTML(list, isAll);
   }
   return "";
 }
@@ -554,6 +555,215 @@ function mountScreener() {
 }
 const screenerLink = (symbol) => `https://www.screener.in/company/${encodeURIComponent(symbol)}/`;
 
+/* ---- history: imported ledger + tradebook (Zerodha Console CSVs) */
+const pct1 = (n) => (n == null ? "—" : (n > 0 ? "+" : "") + n.toFixed(1) + "%");
+async function loadHistory(accId) {
+  if (accId === "all") {
+    try { state.histOverview = await api("/api/history/overview"); } catch (e) { toast("History: " + e.message, true); }
+  } else {
+    const [status, ledger, trades] = await Promise.all([api(`/api/history/${accId}/status`), api(`/api/history/${accId}/ledger`), api(`/api/history/${accId}/trades`)]).catch(e => { toast("History: " + e.message, true); return [null, null, null]; });
+    state.hist[accId] = { status, ledger, trades, at: Date.now() };
+  }
+  if (state.section === "history") renderMain();
+}
+/* small SVG bar chart: data = [{label, v}] ; two-series variant when v2 given */
+function barsSVG(data, opts = {}) {
+  const w = opts.w || 640, h = opts.h || 160, padL = 8, padB = 22, n = data.length; if (!n) return "";
+  const max = Math.max(1, ...data.map(d => Math.max(Math.abs(d.v || 0), Math.abs(d.v2 || 0))));
+  const hasNeg = data.some(d => (d.v || 0) < 0 || (d.v2 || 0) < 0);
+  const zero = hasNeg ? (h - padB) / 2 : h - padB;
+  const scale = (hasNeg ? (h - padB) / 2 : h - padB) / max;
+  const bw = Math.max(2, (w - padL) / n - 2);
+  const bars = data.map((d, i) => {
+    const x = padL + i * ((w - padL) / n);
+    const mk = (v, color, off) => { if (!v) return ""; const bh = Math.abs(v) * scale; const y = v >= 0 ? zero - bh : zero; return `<rect x="${(x + off).toFixed(1)}" y="${y.toFixed(1)}" width="${(opts.v2 ? bw / 2 - 1 : bw).toFixed(1)}" height="${Math.max(1, bh).toFixed(1)}" rx="2" fill="${color}" data-tip="<b>${esc(d.label)}</b><span class='num'>${opts.fmt ? opts.fmt(v) : inrTip(v)}</span>"/>`; };
+    return mk(d.v, d.color || (d.v >= 0 ? (opts.c1 || "var(--s1)") : "var(--down)"), 0) + (opts.v2 ? mk(d.v2, opts.c2 || "var(--s2)", bw / 2) : "");
+  }).join("");
+  const step = Math.ceil(n / 8);
+  const labels = data.map((d, i) => i % step ? "" : `<text x="${(padL + i * ((w - padL) / n)).toFixed(1)}" y="${h - 6}" font-size="10" fill="var(--ink-3)">${esc(d.label)}</text>`).join("");
+  return `<svg viewBox="0 0 ${w} ${h}" class="bars" preserveAspectRatio="none"><line x1="0" x2="${w}" y1="${zero}" y2="${zero}" stroke="var(--line-2)"/>${bars}${labels}</svg>`;
+}
+function lineSVG(points, opts = {}) {
+  const w = opts.w || 640, h = opts.h || 140, n = points.length; if (n < 2) return "";
+  const vals = points.map(p => p.v), min = Math.min(0, ...vals), max = Math.max(1, ...vals), span = max - min || 1;
+  const X = i => (i / (n - 1) * (w - 4) + 2), Y = v => (h - 18 - (v - min) / span * (h - 26));
+  const d = points.map((p, i) => `${i ? "L" : "M"}${X(i).toFixed(1)},${Y(p.v).toFixed(1)}`).join(" ");
+  const zeroY = Y(0);
+  const dots = points.map((p, i) => `<circle cx="${X(i).toFixed(1)}" cy="${Y(p.v).toFixed(1)}" r="6" fill="transparent" data-tip="<b>${esc(p.label)}</b><span class='num'>${opts.fmt ? opts.fmt(p.v) : inrTip(p.v)}</span>"/>`).join("");
+  const step = Math.ceil(n / 8);
+  const labels = points.map((p, i) => i % step ? "" : `<text x="${X(i).toFixed(1)}" y="${h - 4}" font-size="10" fill="var(--ink-3)">${esc(p.label)}</text>`).join("");
+  return `<svg viewBox="0 0 ${w} ${h}" class="bars" preserveAspectRatio="none">${min < 0 ? `<line x1="0" x2="${w}" y1="${zeroY}" y2="${zeroY}" stroke="var(--line-2)"/>` : ""}<path d="${d}" fill="none" stroke="${opts.color || "var(--accent)"}" stroke-width="2" stroke-linejoin="round"/>${dots}${labels}</svg>`;
+}
+const fyShort = (fy) => fy.replace("FY", "");
+const monShort = (m) => { const [y, mm] = m.split("-"); return ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"][+mm - 1] + " " + y.slice(2); };
+
+function historyHTML(list, isAll) {
+  const importBtn = `<button class="btn primary" data-act="import">${ICON.plus} Import statement</button>`;
+  if (isAll) {
+    const d = state.histOverview;
+    if (!d) { loadHistory("all"); return `<div class="card"><div class="empty"><div class="skel" style="width:160px;margin:0 auto"></div></div></div>`; }
+    const withLedger = d.accounts.filter(a => a.ledger);
+    if (!withLedger.length) return historyEmptyHTML(importBtn);
+    const tot = withLedger.reduce((s, a) => ({ dep: s.dep + a.ledger.deposits, wd: s.wd + a.ledger.withdrawals, net: s.net + a.ledger.net_invested, cur: s.cur + (a.ledger.current_value || 0), fno: s.fno + (a.ledger.fno_total || 0), ch: s.ch + (a.ledger.charges_total || 0), live: s.live + (a.ledger.current_value != null ? 1 : 0) }), { dep: 0, wd: 0, net: 0, cur: 0, fno: 0, ch: 0, live: 0 });
+    const gain = tot.live === withLedger.length ? tot.cur - tot.net : null;
+    const rows = d.accounts.map(a => `<tr data-sel="${a.id}" style="cursor:pointer"><td><span class="sym"><span class="holders"><i style="--c:${colorVar(a.color)}">${esc(initials(a.name)[0])}</i></span>${esc(a.name)}</span></td>
+      ${a.ledger ? `<td class="num muted">${a.ledger.from.slice(0, 7)} → ${a.ledger.to.slice(0, 7)}</td><td class="num">${inr(a.ledger.deposits)}</td><td class="num">${inr(a.ledger.withdrawals)}</td><td class="num">${inr(a.ledger.net_invested)}</td>
+        <td class="num">${a.ledger.current_value != null ? inr(a.ledger.current_value) : "<span class='muted'>login</span>"}</td>
+        <td class="num ${cls(a.ledger.absolute_gain || 0)}">${a.ledger.absolute_gain != null ? sinr(a.ledger.absolute_gain) : "—"}</td>
+        <td class="num ${cls(a.ledger.xirr || 0)}">${pct1(a.ledger.xirr)}</td><td class="num ${cls(a.ledger.fno_total)}">${sinr(a.ledger.fno_total)}</td><td class="num down">${inr(a.ledger.charges_total)}</td>`
+        : `<td colspan="9" class="muted">No ledger imported yet</td>`}</tr>`).join("");
+    const tile = (k, v, s, i) => `<div class="tile" style="--i:${i}"><div class="k">${k}</div><div class="v num">${v}</div><div class="s">${s}</div></div>`;
+    return `<div class="stats" style="grid-template-columns:repeat(5,1fr)">
+        ${tile("Deposited from bank", inr(tot.dep), `<span class="muted">${withLedger.length} account${withLedger.length > 1 ? "s" : ""} with ledger</span>`, 0)}
+        ${tile("Withdrawn", inr(tot.wd), `<span class="muted">back to bank</span>`, 1)}
+        ${tile("Net capital in", inr(tot.net), `<span class="muted">deposits − withdrawals</span>`, 2)}
+        ${tile("Gain on capital", gain == null ? "—" : `<span class="${cls(gain)}">${sinr(gain)}</span>`, gain == null ? `<span class="muted">log in all accounts to compute</span>` : `<span class="pill ${cls(gain)}">${arrow(gain)} ${pct(tot.net ? gain / tot.net * 100 : 0)} absolute</span>`, 3)}
+        ${tile("F&O net · charges", `<span class="${cls(tot.fno)}">${sinr(tot.fno)}</span>`, `<span class="muted">charges ${inr(tot.ch)} across family</span>`, 4)}
+      </div>
+      <div class="card" style="--i:1"><div class="card-h"><h3>Capital by account</h3>${importBtn}</div>
+      <div class="tbl-wrap"><table><thead><tr><th>Account</th><th>Ledger span</th><th>Deposited</th><th>Withdrawn</th><th>Net in</th><th>Value now</th><th>Gain</th><th>XIRR</th><th>F&amp;O net</th><th>Charges</th></tr></thead><tbody>${rows}</tbody></table></div>
+      <div class="hint" style="padding:0 16px 14px">XIRR is the annualised return on your own money: every deposit counts as money out, every withdrawal as money back, and today’s account value as the final inflow. Click a row for the full picture of that account.</div></div>`;
+  }
+  const acc = list[0];
+  const h = state.hist[acc.id];
+  if (!h) { loadHistory(acc.id); return `<div class="card"><div class="empty"><div class="skel" style="width:160px;margin:0 auto"></div></div></div>`; }
+  const L = h.ledger, T = h.trades, S = h.status;
+  if ((!L || L.empty) && (!T || T.empty)) return historyEmptyHTML(importBtn, acc);
+  const sub = [["capital", "Capital & returns"], ["fno", "F&O"], ["charges", "Charges"], ["trades", "Trades"], ["data", "Data"]];
+  const tabs = `<div class="tabs" style="margin-bottom:14px">${sub.map(([k, l]) => `<button class="tab ${state.histView === k ? "active" : ""}" data-hview="${k}">${l}</button>`).join("")}</div>`;
+  let body = "";
+  if (state.histView === "capital") body = capitalHTML(L, acc);
+  else if (state.histView === "fno") body = fnoHTML(L);
+  else if (state.histView === "charges") body = chargesHTML(L);
+  else if (state.histView === "trades") body = tradesHTML(T);
+  else body = dataHTML(S, acc, importBtn);
+  return tabs + body;
+}
+function historyEmptyHTML(importBtn, acc) {
+  return `<div class="card"><div class="empty" style="padding:50px 20px"><b>No statements imported${acc ? " for " + esc(acc.name) : ""}</b>
+    Download the <b>Ledger</b> (Funds → Statement) and the <b>Tradebook</b> from console.zerodha.com as CSV and import them here.<br>First time: the full history. After that: just the current financial year (1 April → today), as often as you like.<div style="margin-top:16px">${importBtn}</div></div></div>`;
+}
+function capitalHTML(L, acc) {
+  if (!L || L.empty) return `<div class="card"><div class="empty">No ledger imported for ${esc(acc.name)} yet. Open <b>Data</b> to import.</div></div>`;
+  const tile = (k, v, s, i, hero) => `<div class="tile ${hero ? "hero" : ""}" style="--i:${i}"><div class="k">${k}</div><div class="v num">${v}</div><div class="s">${s}</div></div>`;
+  const cum = []; let run = 0;
+  for (const m of L.monthly) { run += m.in - m.out; cum.push({ label: monShort(m.month), v: run }); }
+  const yrs = L.yearly.map(y => ({ label: fyShort(y.fy), v: y.in, v2: y.out }));
+  return `<div class="stats">
+      ${tile("Net capital in", inr(L.net_invested), `<span class="muted">${inr(L.deposits)} in · ${inr(L.withdrawals)} out · since ${L.from.slice(0, 7)}</span>`, 0, true)}
+      ${tile("Value today", L.current_value != null ? inr(L.current_value) : "—", L.current_value != null ? `<span class="muted">holdings + cash + MF</span>` : `<span class="muted">log in to compute</span>`, 1)}
+      ${tile("Gain on capital", L.absolute_gain != null ? `<span class="${cls(L.absolute_gain)}">${sinr(L.absolute_gain)}</span>` : "—", L.absolute_gain != null ? `<span class="pill ${cls(L.absolute_gain)}">${arrow(L.absolute_gain)} ${pct(L.net_invested ? L.absolute_gain / L.net_invested * 100 : 0)} absolute</span>` : "", 2)}
+      ${tile("XIRR", L.xirr != null ? `<span class="${cls(L.xirr)}">${pct1(L.xirr)}</span>` : "—", `<span class="muted">per year, on dated cash flows${L.simple_cagr != null ? ` · simple CAGR ${pct1(L.simple_cagr)}` : ""}</span>`, 3)}
+      ${tile("Time invested", L.years != null ? L.years + " yrs" : "—", `<span class="muted">${L.rows.toLocaleString("en-IN")} ledger rows · ${L.negative_months} month${L.negative_months === 1 ? "" : "s"} with negative balance</span>`, 4)}
+    </div>
+    <div class="grid" style="grid-template-columns:1fr 1fr">
+      <div class="card" style="--i:1"><div class="card-h"><h3>Net capital over time</h3><span class="muted">cumulative deposits − withdrawals</span></div><div style="padding:0 12px 12px">${lineSVG(cum)}</div></div>
+      <div class="card" style="--i:2"><div class="card-h"><h3>Deposits vs withdrawals by FY</h3><span class="muted"><span class="holders"><i style="--c:var(--s1)"></i></span> in &nbsp; <span class="holders"><i style="--c:var(--s2)"></i></span> out</span></div><div style="padding:0 12px 12px">${barsSVG(yrs, { v2: true, h: 170 })}</div></div>
+    </div>
+    <div class="card" style="--i:3;margin-top:16px"><div class="card-h"><h3>Year by year</h3></div><div class="tbl-wrap"><table><thead><tr><th>FY</th><th>Deposited</th><th>Withdrawn</th><th>Net in</th><th>Equity bought</th><th>Equity sold</th><th>F&amp;O net</th><th>Charges</th></tr></thead>
+      <tbody>${L.yearly.map(y => `<tr><td>${esc(y.fy)}</td><td class="num">${inr(y.in)}</td><td class="num">${inr(y.out)}</td><td class="num ${cls(y.in - y.out)}">${sinr(y.in - y.out)}</td><td class="num">${inr(y.equity_buy)}</td><td class="num">${inr(y.equity_sell)}</td><td class="num ${cls(y.fno)}">${sinr(y.fno)}</td><td class="num down">${inr(y.charges)}</td></tr>`).join("")}</tbody></table></div></div>`;
+}
+function fnoHTML(L) {
+  if (!L || L.empty || !Object.keys(L.fno).length) return `<div class="card"><div class="empty"><b>No derivatives activity in the ledger</b></div></div>`;
+  const segs = Object.entries(L.fno);
+  const colors = ["var(--s1)", "var(--s2)", "var(--s3)"];
+  return `<div class="stats" style="grid-template-columns:repeat(${Math.min(4, segs.length + 1)},1fr)">
+      <div class="tile hero" style="--i:0"><div class="k">All derivatives, net</div><div class="v num ${cls(L.fno_total)}">${sinr(L.fno_total)}</div><div class="s"><span class="muted">realised P&amp;L from daily net obligations, before charges</span></div></div>
+      ${segs.map(([s, v], i) => `<div class="tile" style="--i:${i + 1}"><div class="k">${esc(s)}</div><div class="v num ${cls(v.total)}">${sinr(v.total)}</div><div class="s"><span class="muted">${v.days.win} up · ${v.days.loss} down days · ${v.monthly[0]?.month ? monShort(v.monthly[0].month) + " → " + monShort(v.monthly[v.monthly.length - 1].month) : ""}</span></div></div>`).join("")}
+    </div>
+    ${segs.map(([s, v], i) => { let run = 0; const cum = v.monthly.map(m => ({ label: monShort(m.month), v: (run += m.pnl) })); return `<div class="card" style="--i:${i + 1};margin-bottom:16px"><div class="card-h"><h3>${esc(s)}</h3><span class="muted">monthly P&amp;L and cumulative</span></div>
+      <div class="grid" style="grid-template-columns:1fr 1fr;padding:0 12px 12px;gap:12px"><div>${barsSVG(v.monthly.map(m => ({ label: monShort(m.month), v: m.pnl })), { h: 150, c1: "var(--up)" })}</div><div>${lineSVG(cum, { h: 150, color: colors[i % 3] })}</div></div></div>`; }).join("")}`;
+}
+function chargesHTML(L) {
+  if (!L || L.empty) return "";
+  const names = { dp: "DP charges (per sale)", amc: "Demat AMC", gateway: "Payment gateway", interest: "Delayed payment interest", pledge: "Pledge charges", penalty: "Penalties & shortfall", tax: "STT / stamp / SEBI (ledger-level)", brokerage: "Brokerage adjustments", other: "Other charges" };
+  const items = Object.entries(L.charges).filter(([, v]) => v > 0).map(([k, v], i) => ({ label: names[k] || k, key: k, value: v, color: colorVar(i + 1) }));
+  const byFy = L.yearly.map(y => ({ label: fyShort(y.fy), v: y.charges }));
+  return `<div class="grid" style="grid-template-columns:1fr 1fr">
+      ${donutCard("Charges by type", items, short(L.charges_total), "TOTAL", "from the ledger only")}
+      <div class="card" style="--i:2"><div class="card-h"><h3>Charges by FY</h3></div><div style="padding:0 12px 12px">${barsSVG(byFy, { h: 200, c1: "var(--s4)" })}</div></div></div>
+    <div class="hint" style="margin-top:12px">Brokerage, STT and exchange fees on each trade are netted inside the equity settlement rows, so they are not itemised here. The contract notes / P&amp;L report from Console carry those.</div>`;
+}
+function tradesHTML(T) {
+  if (!T || T.empty) return `<div class="card"><div class="empty"><b>No tradebook imported</b>Import the Tradebook CSV from Console under <b>Data</b> to see realised P&amp;L per stock, win rate and holding periods.</div></div>`;
+  const tile = (k, v, s, i, hero) => `<div class="tile ${hero ? "hero" : ""}" style="--i:${i}"><div class="k">${k}</div><div class="v num">${v}</div><div class="s">${s}</div></div>`;
+  const q = state.q.trim().toUpperCase();
+  const syms = T.by_symbol.filter(s => !q || s.symbol.includes(q));
+  return `<div class="stats">
+      ${tile("Realised P&L (FIFO)", `<span class="${cls(T.realised_total)}">${sinr(T.realised_total)}</span>`, `<span class="muted">${T.sell_count} sells matched against buys</span>`, 0, true)}
+      ${tile("Trades", T.trades.toLocaleString("en-IN"), `<span class="muted">${T.symbols} symbols · ${T.from.slice(0, 7)} → ${T.to.slice(0, 7)}</span>`, 1)}
+      ${tile("Win rate", T.win_rate != null ? T.win_rate + "%" : "—", `<span class="muted">sells closed at a profit</span>`, 2)}
+      ${tile("Avg holding", T.avg_hold_days != null ? T.avg_hold_days + " d" : "—", `<span class="muted">buy to sell, FIFO lots</span>`, 3)}
+      ${tile("Best · worst", `<span class="up">${esc(T.best[0]?.symbol || "—")}</span>`, `<span class="muted">${T.best[0] ? sinr(T.best[0].realised) : ""} · <span class="down">${esc(T.worst[0]?.symbol || "")}</span> ${T.worst[0] ? sinr(T.worst[0].realised) : ""}</span>`, 4)}
+    </div>
+    <div class="grid" style="grid-template-columns:1fr 1fr">
+      <div class="card" style="--i:1"><div class="card-h"><h3>Realised P&amp;L by FY</h3></div><div style="padding:0 12px 12px">${barsSVG(T.yearly.map(y => ({ label: fyShort(y.fy), v: y.realised })), { h: 170, c1: "var(--up)" })}</div></div>
+      <div class="card" style="--i:2"><div class="card-h"><h3>Trades per month</h3></div><div style="padding:0 12px 12px">${barsSVG(T.monthly.map(m => ({ label: monShort(m.month), v: m.trades })), { h: 170, c1: "var(--s7)", fmt: v => v + " trades" })}</div></div>
+    </div>
+    <div class="card" style="--i:3;margin-top:16px"><div class="card-h"><h3>By stock <span class="muted">${syms.length}</span></h3><label class="search">${ICON.search}<input id="q" placeholder="Filter symbol…" value="${esc(state.q)}"></label></div>
+      <div class="tbl-wrap"><table><thead><tr><th>Symbol</th><th>Trades</th><th>Bought</th><th>Sold</th><th>Realised</th><th>Still held (FIFO)</th><th>First</th><th>Last</th><th></th></tr></thead>
+      <tbody>${syms.slice(0, 200).map(s => `<tr><td><span class="sym">${esc(s.symbol)}</span></td><td class="num">${s.trades}</td><td class="num">${inr(s.buys)}</td><td class="num">${inr(s.sells)}</td><td class="num ${cls(s.realised)}">${sinr(s.realised)}</td><td class="num">${s.open_qty ? `<span class="amt">${num(s.open_qty, 0)}</span> · ${inr(s.open_cost)}` : "<span class='muted'>—</span>"}</td><td class="num muted">${s.first}</td><td class="num muted">${s.last}</td><td><button class="star on" style="opacity:1" data-chart="NSE/${esc(s.symbol)}" title="Chart">${ICON.chart}</button></td></tr>`).join("")}</tbody></table></div></div>`;
+}
+function dataHTML(S, acc, importBtn) {
+  const block = (kind, label) => { const d = S[kind]; return `<div class="card" style="--i:1"><div class="card-h"><h3>${label}</h3><span class="muted">${d.rows ? `${d.rows.toLocaleString("en-IN")} rows · ${d.from} → ${d.to}` : "nothing imported"}</span></div>
+      ${d.fys.length ? `<div class="tbl-wrap"><table><thead><tr><th>Financial year</th><th>Rows</th><th>Status</th></tr></thead><tbody>${d.fys.map(f => `<tr><td>${esc(f.fy)}</td><td class="num">${f.rows.toLocaleString("en-IN")}</td><td>${f.archived ? `<span class="chip ok">archived · protected</span>` : `<span class="chip open">current · refreshed on import</span>`}</td></tr>`).join("")}</tbody></table></div>` : ""}
+      ${d.last_import ? `<div class="hint" style="padding:10px 16px 14px">Last import ${esc(d.last_import.at.replace("T", " "))} · ${esc(d.last_import.file || "")} · ${d.last_import.added} added, ${d.last_import.removed} replaced${d.last_import.skipped_archived ? `, ${d.last_import.skipped_archived} skipped (archived FY)` : ""}</div>` : ""}</div>`; };
+  return `<div class="banner"><div class="ic">${ICON.plus}</div><div><b>Import a statement for ${esc(acc.name)}</b><span>Console → Funds → Statement → Ledger (CSV), and Console → Reports → Tradebook (CSV). Upload the current FY any time; ended FYs are archived and never overwritten.</span></div>${importBtn}</div>
+    <div class="grid" style="grid-template-columns:1fr 1fr">${block("ledger", "Ledger")}${block("trades", "Tradebook")}</div>`;
+}
+
+/* import dialog: pick account, drop CSVs, preview, confirm */
+function importDialog(defaultAcc) {
+  const accs = accounts();
+  if (!accs.length) return toast("Add an account first", true);
+  let files = [];
+  const render = (msg) => {
+    modal(`<h3>Import statements</h3><div class="sub">Zerodha Console CSVs: Ledger and Tradebook. The file is read in your browser and stored only in this app’s data folder.</div>
+      ${msg ? `<div class="err" style="${msg.ok ? "background:var(--up-soft);color:var(--up)" : ""}">${esc(msg.text)}</div>` : ""}
+      <div class="field"><label>Account</label><select name="acc" class="sel" id="imp-acc">${accs.map(a => `<option value="${a.id}" ${a.id === defaultAcc ? "selected" : ""}>${esc(a.name)} · ${esc(a.user_id)}</option>`).join("")}</select></div>
+      <div class="drop" id="drop">${ICON.plus}<div>Drop CSV files here or <label class="link">browse<input type="file" id="imp-file" accept=".csv,text/csv" multiple hidden></label></div><div class="hint">Ledger and tradebook can be dropped together. Filenames like ledger-AB1234.csv are matched to the account automatically.</div></div>
+      <div id="imp-list">${files.map((f, i) => `<div class="imp-row"><div><b>${esc(f.name)}</b> <span class="chip">${f.kind || "?"}</span> ${f.preview ? `<span class="muted">${f.preview.rows.toLocaleString("en-IN")} rows · ${f.preview.from} → ${f.preview.to}</span>` : ""}
+          ${f.preview ? `<div class="hint">${f.preview.fys_new.length ? `Will refresh ${f.preview.fys_new.map(esc).join(", ")} (${f.preview.replaces} stored rows in this range replaced).` : ""} ${f.preview.fys_archived.length ? `<span class="down">Skips archived ${f.preview.fys_archived.map(esc).join(", ")}</span> unless you tick “also replace archived years”.` : ""} ${f.preview.client_hint && !accs.find(a => a.id === $("#imp-acc")?.value)?.user_id.includes(f.preview.client_hint) ? `<span class="down">File looks like it belongs to ${esc(f.preview.client_hint)}.</span>` : ""}</div>` : ""}${f.error ? `<div class="hint down">${esc(f.error)}</div>` : ""}</div>
+          <button class="btn ghost" data-rm="${i}">✕</button></div>`).join("")}</div>
+      <label class="hint" style="display:flex;gap:8px;align-items:center;margin:8px 0"><input type="checkbox" id="imp-force"> Also replace archived (ended) financial years with this file’s rows</label>
+      <div class="row"><button type="button" class="btn ghost" data-cancel>Close</button><button type="button" class="btn primary" id="imp-go" ${files.some(f => f.preview) ? "" : "disabled"}>Import ${files.filter(f => f.preview).length || ""} file${files.filter(f => f.preview).length === 1 ? "" : "s"}</button></div>`);
+    const drop = $("#drop");
+    drop.addEventListener("dragover", e => { e.preventDefault(); drop.classList.add("over"); });
+    drop.addEventListener("dragleave", () => drop.classList.remove("over"));
+    drop.addEventListener("drop", e => { e.preventDefault(); drop.classList.remove("over"); addFiles(e.dataTransfer.files); });
+    $("#imp-file").addEventListener("change", e => addFiles(e.target.files));
+    $("#imp-acc").addEventListener("change", () => previewAll());
+    $("#imp-list").addEventListener("click", e => { const b = e.target.closest("[data-rm]"); if (b) { files.splice(+b.dataset.rm, 1); render(); } });
+    $("#imp-go").addEventListener("click", doImport);
+  };
+  const accId = () => $("#imp-acc").value;
+  async function addFiles(list) {
+    for (const f of list) { const text = await f.text(); files.push({ name: f.name, text, kind: null, preview: null, error: null }); }
+    // auto-pick the account from the filename (ledger-AB1234.csv)
+    const m = files.map(f => f.name.match(/\b([A-Z]{2}\d{4})\b/)).find(Boolean);
+    if (m) { const a = accs.find(a => a.user_id === m[1]); if (a) $("#imp-acc").value = a.id; }
+    await previewAll();
+  }
+  async function previewAll() {
+    for (const f of files) {
+      try { const p = await api(`/api/history/${accId()}/preview`, { method: "POST", body: JSON.stringify({ text: f.text, filename: f.name }) }); f.kind = p.kind; f.preview = p; f.error = null; }
+      catch (e) { f.kind = null; f.preview = null; f.error = e.message; }
+    }
+    render();
+  }
+  async function doImport() {
+    const force = $("#imp-force").checked, id = accId(); const results = [];
+    for (const f of files.filter(f => f.preview)) {
+      try { const r = await api(`/api/history/${id}/import`, { method: "POST", body: JSON.stringify({ text: f.text, filename: f.name, kind: f.kind, replace_archived: force }) }); results.push(`${f.name}: ${r.added} added, ${r.removed} replaced${r.skipped_archived ? `, ${r.skipped_archived} skipped` : ""}`); }
+      catch (e) { results.push(`${f.name}: ${e.message}`); }
+    }
+    files = []; delete state.hist[id]; state.histOverview = null;
+    render({ ok: true, text: results.join(" · ") });
+    if (state.section === "history") renderMain();
+  }
+  render();
+}
+
 function onboardHTML() {
   return `<div class="onboard"><h2>Every account, <em style="color:var(--accent);font-style:italic">one ledger.</em></h2>
     <p>Add each family member once. Every morning you log them all in from here, one popup each, and see holdings, P&amp;L, positions, orders and funds for everyone in a single place.</p>
@@ -749,6 +959,8 @@ document.addEventListener("click", async e => {
   }
   const clr = e.target.closest("[data-clear]");
   if (clr) { if (clr.dataset.clear === "cap") state.capFilter = null; else state.accFilter = null; renderMain(); return; }
+  const hv = e.target.closest("[data-hview]");
+  if (hv) { state.histView = hv.dataset.hview; state.q = ""; renderMain(); return; }
   const ic = e.target.closest("[data-idxchart]");
   if (ic) { e.stopPropagation(); const r = state.indices.items.find(x => x.name === ic.dataset.idxchart); return openChart("NSE", r.name, r.name, { tv: r.tv, row: { symbol: r.name, name: r.name, last_price: r.last, close_price: r.close, instrument_token: r.instrument_token, holders: [] } }); }
   if (e.target.closest('[data-act="idxrefresh"]')) { state.indices = null; renderMain(); loadIndices(true); return; }
@@ -781,6 +993,7 @@ document.addEventListener("click", async e => {
     }
     case "openkite": { try { await api(`/api/accounts/${act.dataset.id}/open_kite`, { method: "POST" }); toast("Opening Kite in " + (accById(act.dataset.id)?.name || "") + "’s browser profile"); } catch (e) { toast(e.message, true); } return; }
     case "privacy": { state.privacy = !state.privacy; localStorage.setItem("fl.privacy", state.privacy ? "1" : "0"); applyPrivacy(); renderMain(); renderRail(); return; }
+    case "import": return importDialog(state.selected === "all" ? accounts()[0]?.id : state.selected);
     case "rail": { const h = document.documentElement; h.dataset.rail = h.dataset.rail === "collapsed" ? "" : "collapsed"; localStorage.setItem("fl.rail", h.dataset.rail); return renderRail(); }
     case "menu": { act.closest(".menu").classList.toggle("open"); return; }
     case "theme": { const h = document.documentElement; h.dataset.theme = h.dataset.theme === "light" ? "dark" : "light"; localStorage.setItem("fl.theme", h.dataset.theme); renderRail(); if (state.section === "screener") renderMain(); return; }

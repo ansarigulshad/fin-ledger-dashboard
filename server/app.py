@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import re
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -11,7 +12,7 @@ from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import browsers, caps, demo, indices, kite, store, watchlist
+from . import browsers, caps, demo, history, indices, kite, store, watchlist
 
 DEMO = os.environ.get("DEMO") == "1"
 CACHE_TTL = float(os.environ.get("CACHE_TTL", "20"))
@@ -118,6 +119,13 @@ class WatchIn(BaseModel):
 
 class NoteIn(BaseModel):
     note: str = ""
+
+
+class StatementIn(BaseModel):
+    text: str                      # raw CSV contents (read in the browser)
+    filename: str = ""
+    kind: str | None = None        # "ledger" | "trades" | None = auto-detect
+    replace_archived: bool = False
 
 
 # ---------------------------------------------------------------- routes: config/accounts
@@ -302,6 +310,84 @@ def overview(force: bool = False):
     snaps = list(_pool.map(lambda a: _fetch(a, force), accs))
     return {"generated_at": time.time(),
             "accounts": [{**_status(a), "snapshot": s} for a, s in zip(accs, snaps)]}
+
+
+# ---------------------------------------------------------------- routes: history (ledger + tradebook imports)
+def _parse_statement(body: StatementIn) -> tuple[str, list[dict]]:
+    kind = body.kind or history.detect(body.text)
+    if kind not in ("ledger", "trades"):
+        raise HTTPException(400, "Not a Zerodha ledger or tradebook CSV (header columns not recognised)")
+    rows = history.parse_ledger(body.text) if kind == "ledger" else history.parse_trades(body.text)
+    if not rows:
+        raise HTTPException(400, "No dated rows found in the file")
+    return kind, rows
+
+
+@app.post("/api/history/{acc_id}/preview")
+def history_preview(acc_id: str, body: StatementIn):
+    _account(acc_id)
+    kind, rows = _parse_statement(body)
+    # which account does the file belong to? ledger particulars carry the client ID
+    hint = None
+    m = re.search(r"\b([A-Z]{2}\d{4})\b", body.filename or "") or re.search(r"from ([A-Z]{2}\d{4})", body.text[:5000])
+    if m:
+        hint = m.group(1)
+    return {"kind": kind, "client_hint": hint, **history.preview(acc_id, kind, rows)}
+
+
+@app.post("/api/history/{acc_id}/import")
+def history_import(acc_id: str, body: StatementIn):
+    _account(acc_id)
+    kind, rows = _parse_statement(body)
+    return {"kind": kind, **history.import_rows(acc_id, kind, rows, body.filename, body.replace_archived)}
+
+
+@app.get("/api/history/{acc_id}/status")
+def history_status(acc_id: str):
+    _account(acc_id)
+    return history.status(acc_id)
+
+
+def _account_value(acc: dict) -> float | None:
+    snap = _fetch(acc)
+    if snap.get("error"):
+        return None
+    total = 0.0
+    for h in snap.get("holdings", []):
+        q = (h.get("quantity") or 0) + (h.get("t1_quantity") or 0) + (h.get("collateral_quantity") or 0)
+        total += q * (h.get("last_price") or 0)
+    for m in snap.get("mf", []):
+        total += (m.get("quantity") or 0) * (m.get("last_price") or 0)
+    eq = (snap.get("margins") or {}).get("equity") or {}
+    total += (eq.get("net") or (eq.get("available") or {}).get("live_balance") or 0)
+    for p in (snap.get("positions") or {}).get("net", []):
+        total += p.get("pnl") or 0
+    return round(total, 2)
+
+
+@app.get("/api/history/{acc_id}/ledger")
+def history_ledger(acc_id: str):
+    acc = _account(acc_id)
+    return history.ledger_summary(acc_id, _account_value(acc))
+
+
+@app.get("/api/history/{acc_id}/trades")
+def history_trades(acc_id: str):
+    _account(acc_id)
+    return history.trades_summary(acc_id)
+
+
+@app.get("/api/history/overview")
+def history_overview():
+    """Per-account capital summary for the family view."""
+    out = []
+    for a in _accounts():
+        s = history.ledger_summary(a["id"], _account_value(a))
+        t = history.trades_summary(a["id"])
+        out.append({"id": a["id"], "name": a["name"], "color": a.get("color", 1),
+                    "ledger": None if s.get("empty") else {k: s.get(k) for k in ("from", "to", "deposits", "withdrawals", "net_invested", "current_value", "xirr", "absolute_gain", "fno_total", "charges_total", "years")},
+                    "trades": None if t.get("empty") else {k: t.get(k) for k in ("from", "to", "trades", "realised_total", "win_rate")}})
+    return {"accounts": out}
 
 
 # ---------------------------------------------------------------- routes: watchlist

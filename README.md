@@ -100,6 +100,34 @@ password logins with a CAPTCHA error, so treat this as best-effort.
 | **Screener** | TradingView's free screener for Indian stocks, plus links to NSE MarketLens, Screener.in, Chartink, Trendlyne and Tickertape. |
 | **Charts** | The chart icon on any holding, watchlist row or index opens a full TradingView chart overlay with links to TradingView, Kite's own chart and Screener.in. |
 
+## History: ledger and tradebook imports
+
+Kite Connect has no API for past statements, so history is an **import**.
+Download from console.zerodha.com as CSV:
+
+- **Ledger:** Funds → Statement → Ledger.
+- **Tradebook:** Reports → Tradebook.
+
+Open the **History** tab, click **Import statement**, pick the account and drop
+the files. A preview shows the date span, the financial years covered and how
+many stored rows will be replaced before anything is written.
+
+- **First import:** the full history.
+- **After that:** just the current financial year (1 April → today), as often
+  as you like. Rows inside the uploaded file's date range are replaced, so
+  re-imports are safe and pick up Zerodha's own corrections.
+- **Ended financial years are archived** after their first import and later
+  uploads never change them, unless you tick "also replace archived years".
+
+What you get: money deposited and withdrawn over the years, net capital in,
+gain on that capital and **XIRR** using today's live account value, F&O P&L
+by segment and month, charges by type and year, and from the tradebook FIFO
+realised P&L per stock, win rate, holding periods and activity by month.
+Imported data is stored under `data/history/`.
+
+Ledger files contain your bank account number. They stay on your machine, but
+strip that before sharing a ledger with anyone else.
+
 ## Where your data lives
 
 Everything is in the `data/` folder next to the code, which is git-ignored:
