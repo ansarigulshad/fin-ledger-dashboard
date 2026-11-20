@@ -947,7 +947,7 @@ document.addEventListener("click", async e => {
   const th = e.target.closest("th[data-sort]");
   if (th) { const k = th.dataset.sort; state.sort = { key: k, dir: state.sort.key === k ? -state.sort.dir : (k === "symbol" ? 1 : -1) }; renderMain(); return; }
   const row = e.target.closest("tr.exp");
-  if (row) { const s = row.dataset.sym; state.expanded.has(s) ? state.expanded.delete(s) : state.expanded.add(s); renderMain(); return; }
+  if (row && !e.target.closest("button, a")) { const s = row.dataset.sym; state.expanded.has(s) ? state.expanded.delete(s) : state.expanded.add(s); renderMain(); return; }
   const seg = e.target.closest(".chart [data-i]");
   if (seg) {
     const chart = seg.closest(".chart"), items = JSON.parse(chart.dataset.items), it = items[+seg.dataset.i], kind = chart.dataset.kind;
